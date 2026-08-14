@@ -40,5 +40,8 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# benchmark data (fetched via `pnpm bench:fetch`, not checked in)
-/bench/data/
+# benchmark data: mostly checked in, but these two individually exceed
+# GitHub's 100MB hard file-size limit, so they stay fetch-on-demand via
+# `pnpm bench:fetch:glove` / `pnpm bench:fetch scidocs`.
+/bench/data/glove/glove.6B.50d.txt
+/bench/data/scidocs/corpus.jsonl

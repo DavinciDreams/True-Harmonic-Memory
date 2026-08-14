@@ -4,6 +4,16 @@
 // so they're orthogonal channels by construction rather than two signals
 // mixed into the same 16 numbers.
 //
+// NOT what context-bound retrieval is scored against anymore: that
+// compression (down to C(NUM_GENERATORS,3) directions) measurably cost
+// ~2x nDCG@10 versus HRR circular convolution at full SPHERE_DIM (see
+// hrr.ts and the root README's Design notes / Context-bound queries
+// sections), which is what engine.ts's retrieve() actually correlates
+// context-bound candidates against now. This module's grade-separated
+// blades are still real and still used — they drive engine.ts's Clifford
+// field and its globalResonance stat — just not the thing that determines
+// context-bound retrieval quality.
+//
 // Content -> grade 1 (the 12 vector blades e1..e12): the "what".
 // Context -> grade 3 (the 220 trivector blades e123..e10-11-12): the
 // "when/where tagged", chosen specifically because it's algebraically
@@ -13,13 +23,14 @@
 // again disjoint from both raw channels — so a superposed field can hold
 // pure-content, pure-context, and bound-content-x-context signal
 // simultaneously without one drowning out another. Time keeps its existing
-// dedicated slot: the e12 bivector (see clifford.ts timeRotor), one of 66
+// dedicated slot: the e1^e2 bivector (see clifford.ts timeRotor), one of 66
 // grade-2 components, so bound content-x-context signal only partially
 // overlaps it rather than colliding head-on.
 //
 // 12 generators, up from an original 4 then 8 — see clifford.ts for the
-// full history and why 12 is a hard ceiling (not a tuned choice) given
-// SPHERE_DIM=256.
+// full history, including why 14 was tried (SPHERE_DIM=384 made it fit
+// capacity-wise) and reverted (real-corpus memory cost wasn't worth a
+// noise-level quality gain).
 //
 // Each channel still uses a fixed random orthonormal projection (not a
 // low-degree Gegenbauer truncation) for the same reason as before: word-hash

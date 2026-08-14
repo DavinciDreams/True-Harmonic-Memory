@@ -6,9 +6,11 @@
 // product generically: the product of two blades is (sign) * (xor of
 // bitmasks), where the sign is the parity of transpositions needed to sort
 // the concatenated generator list (metric here is Euclidean, so repeated
-// generators contribute +1, no extra sign). This is what lets us bind
-// (geometric product), rotate (rotors) and superpose (addition) memories
-// in one small, exact algebra.
+// generators contribute +1, no extra sign). This is what lets us rotate
+// (rotors) and superpose (addition) memories in one small, exact algebra —
+// geometric product (`gp()`) is still used for that (see engine.ts's
+// Clifford field / globalResonance stat), but no longer for the binding
+// context-bound retrieval is actually scored against; see hrr.ts.
 //
 // SPARSE representation (Map<bitmask, coefficient>), not a dense
 // Float64Array of all 2^n components: a dense array was the representation
@@ -22,14 +24,21 @@
 // power-of-two, letting n grow well past where dense storage would already
 // have been infeasible.
 //
-// n=12 (not more): this is a hard ceiling from blade.ts's basis
-// construction, not a computational one — the context channel needs
-// C(n,3) mutually orthonormal directions in SPHERE_DIM=256 dimensions
-// (see blade.ts / linalg.ts), and you cannot have more than SPHERE_DIM
-// orthonormal vectors in a SPHERE_DIM-dimensional space. C(12,3)=220 fits
-// under 256; C(13,3)=286 does not. See the root README for what this bump
-// bought in practice (checked against the n=8→10 result, which already
-// showed diminishing returns before this ceiling was even reached).
+// n=12: a capacity ceiling from blade.ts's basis construction (the context
+// channel needs C(n,3) mutually orthonormal directions in SPHERE_DIM
+// dimensions, and you cannot have more than SPHERE_DIM orthonormal vectors
+// in a SPHERE_DIM-dimensional space), but also a *practical* one, measured
+// directly rather than assumed: with SPHERE_DIM raised to 384 (see
+// sphere.ts), C(13,3)=286 and C(14,3)=364 both fit under 384, so n=14 was
+// tried — reachable in principle, but at Cl(14,0) each stored record's
+// bound-family blades (grades 2+4, C(14,2)+C(14,4)=1092 slots each) got
+// large enough that indexing SCIDOCS (~25.7K docs) OOM'd Node's default
+// ~4GB heap, even after the near-zero-coefficient pruning below and
+// dropping MemoryRecord's dead `bound` field. It only needed 12GB+ to
+// complete, for a context-bound nDCG@10 gain over n=12 of 0.0595→0.0601 —
+// ~1%, within noise. Not worth the fragility; reverted to 12. Re-derive
+// this number (and re-measure at real corpus scale, not just quality) if
+// SPHERE_DIM changes again.
 
 export const NUM_GENERATORS = 12;
 export const BLADE_COUNT = 1 << NUM_GENERATORS; // 4096 — the full space size; never allocated directly (see above)
@@ -61,6 +70,34 @@ function productSign(a: number, b: number): number {
   return sum % 2 === 0 ? 1 : -1;
 }
 
+// Below this magnitude, a coefficient is float noise, not signal — see
+// prune()'s doc comment for why that noise accumulates here specifically.
+const EPSILON = 1e-9;
+
+/**
+ * Coefficients that algebraically cancel to exactly 0 rarely land on exactly
+ * 0 in floating point — gp() sums several av*bv terms per output index (see
+ * below), so a cancellation like 0.7071...*0.7071... - 0.7071...*0.7071...
+ * typically leaves a ~1e-17 residue instead of 0. sandwich() (two chained
+ * gp() calls) is the worst offender: rotor conjugation is grade-preserving
+ * in exact arithmetic (an established Clifford-algebra theorem — see
+ * blade.ts's grade-disjointness comment for why that matters here), but the
+ * *intermediate* gp(r, a) is not grade-pure, so the second gp() multiplies
+ * against those extra grades and their cancellation-to-zero is exactly this
+ * kind of near-zero float residue, not a true zero the Map ever drops.
+ * Measured effect on a real record's `rotated` blade at Cl(14,0): 1588
+ * stored entries, 496 of them (~31%) below 1e-9, largest of those ~3.5e-18 —
+ * pure noise, no signal, but every one of them still costs a Map slot and
+ * gets iterated by every later add()/innerProduct()/magnitude() call. Pruned
+ * once here (gp()'s output) rather than at every downstream call site.
+ */
+function prune(m: Multivector): Multivector {
+  for (const [i, v] of m) {
+    if (Math.abs(v) < EPSILON) m.delete(i);
+  }
+  return m;
+}
+
 /** Geometric product of two multivectors — O(nnz(a) * nnz(b)), not O(2^n). */
 export function gp(a: Multivector, b: Multivector): Multivector {
   const out = new Map<number, number>();
@@ -73,7 +110,7 @@ export function gp(a: Multivector, b: Multivector): Multivector {
       out.set(bits, (out.get(bits) ?? 0) + sign * av * bv);
     }
   }
-  return out;
+  return prune(out);
 }
 
 export function add(a: Multivector, b: Multivector): Multivector {

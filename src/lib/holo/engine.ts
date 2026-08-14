@@ -1,7 +1,7 @@
 // The holographic memory engine: ties bit->sphere mapping, Gegenbauer
-// spectral projection, and Clifford-algebra binding/superposition/retrieval
-// into one stateful store, plus a 3-tier (recent / repeated / long-term)
-// consolidation policy.
+// spectral projection, HRR binding (hrr.ts), and Clifford-algebra
+// superposition/retrieval into one stateful store, plus a 3-tier
+// (recent / repeated / long-term) consolidation policy.
 //
 // Time is a logical tick counter (not wall-clock) so the demo is
 // reproducible and doesn't depend on how fast someone clicks around.
@@ -25,6 +25,8 @@ import { spectralProject } from "./gegenbauer";
 import { projectTo3D } from "./projection";
 import { hashString } from "./random";
 import { IdfLookup, sphereDot, textToSphereVector } from "./sphere";
+import { ANNIndex } from "./ann";
+import { circularConvolve, dot as hrrDot, normalize as hrrNormalize } from "./hrr";
 
 export type Tier = "recent" | "repeated" | "long-term";
 
@@ -40,11 +42,32 @@ export interface MemoryRecord {
   rotorAngle: number;
   bucket: number; // which field bucket (hashed from context) this record's contribution lives in
   spectrum: number[];
-  contentBlade: Multivector;
-  contextBlade: Multivector;
-  bound: Multivector; // content (x) context, before the time rotor
+  // content.blade/ctx.blade (the Clifford grade-1/grade-3 projections)
+  // aren't stored on the record: they're only ever needed as local
+  // variables in buildRecord() to compute `bound` for the Clifford field —
+  // nothing reads a stored contentBlade/contextBlade after construction
+  // (same dead-field pattern the `bound` field itself was fixed for — see
+  // git history / README Design notes). At Cl(12,0), contextBlade alone
+  // holds up to 220 entries; across a 25.7K-doc corpus that's real memory
+  // saved for a field nothing ever read.
+  //
+  // `bound` (content (x) context via gp(), before the time rotor) is the
+  // same story — not stored either, same reasoning.
   boundNorm: Multivector; // normalize(bound), cached — see retrieve()
   rotated: Multivector; // bound after the time rotor is applied
+  // HRR (Plate 1995) binding: normalize(circularConvolve(content.sphereVec,
+  // context.sphereVec)) — full SPHERE_DIM, no grade compression. This is
+  // what retrieve() actually scores context-bound candidates against now
+  // (see the README's "Context-bound queries" section for the measured
+  // ~2x nDCG@10 win over boundNorm's grade-3-blade-compressed Clifford
+  // product). boundNorm/rotated/the Clifford field above are kept — not
+  // dead code — for the coarse globalResonance stat and time-phase
+  // superposition; see contribution()/retrieve()'s wantGlobalResonance
+  // branch. A hybrid, deliberately: full replacement would have been
+  // simpler code, but this keeps "Clifford geometric product" true for the
+  // time-phase/field subsystem while fixing the actual quality bottleneck
+  // (per-record context-bound scoring), which is what was asked for.
+  boundHrr: Float64Array;
   point3d: [number, number, number];
   // Full SPHERE_DIM sphere vector for the content channel, kept alongside
   // the compressed grade-1 blade. The blade is what the field/binding path
@@ -115,26 +138,54 @@ interface Encoded {
   sphereVec: Float64Array;
 }
 
+/** Just what retrieve() needs to score candidates — see encodeChannel's `full` param. */
+interface QueryEncoded {
+  blade: Multivector;
+  sphereVec: Float64Array;
+}
+
+// `full` gates spectrum/point3d: both are UI-only (spectrum chart, 3D scene)
+// and neither is read anywhere on the query path (retrieve() only uses
+// .blade/.sphereVec below) — computing them per query was pure waste,
+// stacked on top of retrieve()'s already-O(N) candidate scan on every
+// search. buildRecord() (storage path) still wants both, so it passes
+// full=true; retrieve() passes full=false. See the README's SCIDOCS section
+// for where this was originally flagged as an unaddressed cost.
 function encodeChannel(
   text: string,
   channel: "content" | "context",
-  idf?: IdfLookup
-): Encoded {
+  idf: IdfLookup | undefined,
+  full: true
+): Encoded;
+function encodeChannel(
+  text: string,
+  channel: "content" | "context",
+  idf: IdfLookup | undefined,
+  full: false
+): QueryEncoded;
+function encodeChannel(
+  text: string,
+  channel: "content" | "context",
+  idf: IdfLookup | undefined,
+  full: boolean
+): Encoded | QueryEncoded {
   const sphereVec = textToSphereVector(text, undefined, idf);
+  // blade: what's actually used for binding/matching. Content and context
+  // are projected onto disjoint grades (see blade.ts) so they're orthogonal
+  // channels rather than two signals sharing the same SPHERE_DIM numbers.
+  const blade =
+    channel === "content" ? sphereToContentBlade(sphereVec) : sphereToContextBlade(sphereVec);
+  if (!full) return { blade, sphereVec };
   // spectrum: the Gegenbauer harmonic decomposition, kept for the spectrum
   // chart / conceptual fidelity to "decompose into harmonic coefficients".
   const spectrum = Array.from(spectralProject(sphereVec));
-  // blade: what's actually used for binding/matching. Content and context
-  // are projected onto disjoint grades (see blade.ts) so they're orthogonal
-  // channels rather than two signals sharing the same 256 numbers.
-  const blade =
-    channel === "content" ? sphereToContentBlade(sphereVec) : sphereToContextBlade(sphereVec);
   const point3d = projectTo3D(sphereVec);
   return { spectrum, blade, point3d, sphereVec };
 }
 
 /**
- * Encode text on the content channel (grade-1 blade). `idf` is optional —
+ * Encode text on the content channel (grade-1 blade), including the
+ * spectrum/point3d fields the interactive UI displays. `idf` is optional —
  * the interactive demo has no fixed corpus to compute document frequencies
  * over, so it's left unweighted (every word counts equally) there. Callers
  * that do have a corpus up front (see HoloStore's constructor, and
@@ -142,12 +193,22 @@ function encodeChannel(
  * bundling — see sphere.ts for why.
  */
 export function encode(text: string, idf?: IdfLookup): Encoded {
-  return encodeChannel(text, "content", idf);
+  return encodeChannel(text, "content", idf, true);
 }
 
 /** Encode text on the context channel (grade-3 blade) — see blade.ts. */
 export function encodeContext(text: string, idf?: IdfLookup): Encoded {
-  return encodeChannel(text, "context", idf);
+  return encodeChannel(text, "context", idf, true);
+}
+
+/** Lean content-channel encode for retrieve()'s query side — see encodeChannel's `full` param. */
+function encodeQuery(text: string, idf?: IdfLookup): QueryEncoded {
+  return encodeChannel(text, "content", idf, false);
+}
+
+/** Lean context-channel encode for retrieve()'s query side — see encodeChannel's `full` param. */
+function encodeContextQuery(text: string, idf?: IdfLookup): QueryEncoded {
+  return encodeChannel(text, "context", idf, false);
 }
 
 export class HoloStore {
@@ -172,6 +233,34 @@ export class HoloStore {
   recent: MemoryRecord[] = [];
   repeated: MemoryRecord[] = [];
   longTerm: MemoryRecord[] = [];
+  // O(1) id -> record lookup, maintained alongside the tier arrays — used
+  // by removeMemory() (used to be an allActive().find(), O(active)) and by
+  // the ANN path below to resolve search hits back to a MemoryRecord.
+  private recordsById: Map<string, MemoryRecord> = new Map();
+  // Content-vector ANN index — opt-in, not automatic (contrast with the
+  // first attempt at this; see ann.ts's header for why). null until
+  // buildContentIndex() is called; retrieve() falls back to its exact scan
+  // whenever it's null, so calling this is purely a speed lever, never
+  // required for correctness.
+  private ann: ANNIndex<string> | null = null;
+
+  /**
+   * Batch-build the content-vector ANN index from every currently-active
+   * record, for retrieve()'s content-only path. Call this once after
+   * bulk-loading a corpus (e.g. after a run of addBulk() calls) — not
+   * automatic, and not kept in sync with later addMemory()/removeMemory()
+   * calls; call it again if the store's contents change enough to matter.
+   * The interactive demo never calls this (its stores stay tiny enough that
+   * the exact scan is already fast — see the README's Design notes for the
+   * measured cost of building this index at all).
+   */
+  buildContentIndex(opts?: { M?: number; efConstruction?: number; seed?: number }) {
+    const active = this.allActive();
+    this.ann = ANNIndex.build(
+      active.map((r): [string, Float64Array] => [r.id, r.contentVector]),
+      opts
+    );
+  }
   // allActive() used to rebuild this (array-spread + Set dedup) from
   // scratch on every call — free at the interactive demo's scale (a few
   // dozen records at most), but it's also what retrieve() calls on every
@@ -218,6 +307,7 @@ export class HoloStore {
     this.recent = this.recent.filter((r) => r.id !== id);
     this.repeated = this.repeated.filter((r) => r.id !== id);
     this.longTerm = this.longTerm.filter((r) => r.id !== id);
+    this.recordsById.delete(id);
     this.invalidateActive();
   }
 
@@ -228,7 +318,7 @@ export class HoloStore {
 
   /** Explicitly delete a memory: pull its contribution out of the field and drop it. */
   removeMemory(id: string) {
-    const r = this.allActive().find((x) => x.id === id);
+    const r = this.recordsById.get(id);
     if (!r) return;
     this.forget(r);
   }
@@ -242,8 +332,33 @@ export class HoloStore {
     repeatCount: number
   ): { record: MemoryRecord; bound: Multivector } {
     const content = encode(text, this.idf);
-    const ctx = encodeContext(context || "∅", this.idf); // empty-context placeholder
+    // Lean (encodeContextQuery, not encodeContext): only ctx.blade/.sphereVec
+    // are ever used below — MemoryRecord has no contextSpectrum/contextPoint3d
+    // field to store the full version's spectrum/point3d into, so computing
+    // them here was pure waste on every single record, forever (the same
+    // full-vs-lean split retrieve()'s query side already gets — this was the
+    // one storage-side spot still calling the full encoder unnecessarily).
+    const ctx = encodeContextQuery(context || "∅", this.idf); // empty-context placeholder
     const bound = gp(content.blade, ctx.blade);
+    // HRR bind: circular convolution at full SPHERE_DIM, no grade
+    // compression — see MemoryRecord.boundHrr's doc comment for why this,
+    // not `bound` above, is what retrieve() actually scores against.
+    //
+    // Skipped (a zero vector instead) for records with no real context:
+    // retrieve()'s content-only path (hasContext=false) never reads
+    // boundHrr at all, and a context-bound query only reaches an
+    // empty-context record's boundHrr in the rare case its hash bucket
+    // collides with bucketOf("∅") — where circularConvolve(content, "∅")
+    // would be semantically meaningless noise anyway, not a real signal; a
+    // zero vector (cosine similarity 0) is *more* correct there, not just
+    // cheaper. `circularConvolve` is O(SPHERE_DIM^2); for a corpus indexed
+    // with addBulk(text) and no context (e.g. bench/index.ts's entire
+    // content-only benchmark — every "Holographic engine" index-time
+    // number in the README came from a run like this), computing it
+    // unconditionally was pure waste on every single record.
+    const boundHrr = context.trim()
+      ? hrrNormalize(circularConvolve(content.sphereVec, ctx.sphereVec))
+      : new Float64Array(content.sphereVec.length);
     const bucket = bucketOf(context);
     const angle = phaseOf(this.clock);
     const rotated = sandwich(timeRotor(angle), bound);
@@ -259,11 +374,9 @@ export class HoloStore {
       rotorAngle: angle,
       bucket,
       spectrum: content.spectrum,
-      contentBlade: content.blade,
-      contextBlade: ctx.blade,
-      bound,
       boundNorm: normalize(bound),
       rotated,
+      boundHrr,
       point3d: content.point3d,
       contentVector: content.sphereVec,
     };
@@ -274,10 +387,11 @@ export class HoloStore {
   addMemory(text: string, context = ""): MemoryRecord {
     const { record, bound } = this.buildRecord(text, context, "recent", 1, 0);
     const existing = this.findResonant(bound);
-    if (existing) return this.reinforce(existing, bound);
+    if (existing) return this.reinforce(existing, bound, record.boundHrr);
 
     this.field[record.bucket] = add(this.field[record.bucket], this.contribution(record));
     this.recent.push(record);
+    this.recordsById.set(record.id, record);
     this.invalidateActive();
     if (this.recent.length > RECENT_CAPACITY) {
       const oldest = this.recent[0];
@@ -300,6 +414,7 @@ export class HoloStore {
     const { record } = this.buildRecord(text, context, "long-term", 1, PROMOTE_TO_LONG_TERM_AT);
     this.field[record.bucket] = add(this.field[record.bucket], this.contribution(record));
     this.longTerm.push(record);
+    this.recordsById.set(record.id, record);
     this.invalidateActive();
     this.clock++;
     return record;
@@ -310,7 +425,10 @@ export class HoloStore {
     let bestScore = -Infinity;
     const nb = normalize(bound);
     for (const r of this.allActive()) {
-      const score = innerProduct(nb, normalize(r.bound));
+      // r.boundNorm is exactly normalize(r.bound), cached at construction —
+      // recomputing it here (as this used to) was a redundant O(nnz) pass
+      // per candidate, every single addMemory() call.
+      const score = innerProduct(nb, r.boundNorm);
       if (score > bestScore) {
         bestScore = score;
         best = r;
@@ -319,7 +437,7 @@ export class HoloStore {
     return bestScore >= RESONANCE_THRESHOLD ? best : null;
   }
 
-  private reinforce(r: MemoryRecord, bound: Multivector): MemoryRecord {
+  private reinforce(r: MemoryRecord, bound: Multivector, boundHrr: Float64Array): MemoryRecord {
     // Pull the old contribution out, re-bind at the current phase, and put
     // an updated (reinforced) contribution back in.
     this.field[r.bucket] = sub(this.field[r.bucket], this.contribution(r));
@@ -327,9 +445,9 @@ export class HoloStore {
     r.repeatCount += 1;
     r.lastSeenTick = this.clock;
     r.rotorAngle = phaseOf(this.clock);
-    r.bound = bound;
     r.boundNorm = normalize(bound);
     r.rotated = sandwich(timeRotor(r.rotorAngle), bound);
+    r.boundHrr = boundHrr;
 
     if (r.repeatCount >= PROMOTE_TO_LONG_TERM_AT) {
       r.tier = "long-term";
@@ -398,17 +516,26 @@ export class HoloStore {
     // deliberate extra filter for "what happened around this time".
     const temporal = opts.temporal ?? false;
 
-    const content = encode(queryText, this.idf);
+    // Lean query-side encode (encodeQuery/encodeContextQuery): retrieve()
+    // never reads .spectrum or .point3d, so it skips computing them — see
+    // encodeChannel's `full` param.
+    const content = encodeQuery(queryText, this.idf);
     const queryVec = content.sphereVec;
     const hasContext = !!queryContext.trim();
     // Only bind context into the probe if the caller actually supplied one —
-    // binding is a geometric product, which deliberately scrambles content
-    // into a different subspace, so a context-free query must be compared
-    // against stored *content* alone, not against the bound (content x
-    // context) pattern, or it would almost never resonate.
-    const qBlade = hasContext
-      ? gp(content.blade, encodeContext(queryContext, this.idf).blade)
-      : content.blade;
+    // binding scrambles content into a different representation, so a
+    // context-free query must be compared against stored *content* alone,
+    // not against the bound (content x context) pattern, or it would almost
+    // never resonate.
+    const ctxQuery = hasContext ? encodeContextQuery(queryContext, this.idf) : null;
+    // Kept for the Clifford field/globalResonance stat below — see
+    // MemoryRecord.boundHrr's doc comment for why actual peak scoring
+    // (further down) uses the HRR bind (queryBoundHrr) instead.
+    const qBlade = hasContext ? gp(content.blade, ctxQuery!.blade) : content.blade;
+    // HRR bind (see hrr.ts): what context-bound peak scoring actually uses.
+    const queryBoundHrr = hasContext
+      ? hrrNormalize(circularConvolve(queryVec, ctxQuery!.sphereVec))
+      : null;
 
     // Hermitian-style inner product against the field. With a context, we
     // can go straight to that context's bucket — the query only has to
@@ -443,15 +570,29 @@ export class HoloStore {
     // context, which defeated the stated point of bucketing entirely for
     // the results that actually get returned. Filtering here both matches
     // that intent and cuts scoring cost roughly NUM_BUCKETS-fold.
+    //
+    // Content-only, with buildContentIndex() called: candidates come from
+    // the ANN index (ann.ts) instead of a full scan. A first attempt at
+    // this inserted into the index incrementally inside addBulk(), which
+    // measured 2.4x slower to build than the identical algorithm run as a
+    // clean, un-interleaved pass — see ann.ts's header for the numbers and
+    // why this version is a caller-triggered batch build instead. Approximate,
+    // by construction — the price for whatever `buildContentIndex()`'s
+    // caller decided the speedup was worth; retrieve() itself never chooses
+    // this over the exact scan on its own. Over-fetches (annEf) past `topK`
+    // since the downstream score also folds in `weight` and, when `temporal`
+    // is requested, a phase window that can reorder within the fetched set
+    // but can't surface a candidate the index search didn't return at all.
+    const annEf = Math.max(topK * 4, 100);
     const candidates = hasContext
       ? this.allActive().filter((r) => r.bucket === bucketOf(queryContext))
-      : this.allActive();
+      : this.ann
+        ? this.ann
+            .search(queryVec, annEf, annEf)
+            .map((id) => this.recordsById.get(id))
+            .filter((r): r is MemoryRecord => !!r)
+        : this.allActive();
     const centerAngle = phaseOf(centerTick);
-    // Hoisted out of the per-record loop below: normalize(qBlade) doesn't
-    // depend on the record, so computing it once per query instead of once
-    // per (query, record) pair turns an O(N) loop with an O(BLADE_COUNT)
-    // normalize() nested inside it back into a real O(N) loop.
-    const qBladeNorm = normalize(qBlade);
     // phaseWeight (a Math.exp call via gaussian(), plus angularDiff) only
     // affects score/ranking when `temporal` is true — the default (false)
     // multiplies it by 1, i.e. discards it, for every candidate except the
@@ -464,16 +605,15 @@ export class HoloStore {
     // ranking; still computed for every candidate up front when `temporal`
     // is true, since then it's part of what ranking has to sort by.
     const peaks: Peak[] = candidates.map((record) => {
-      // Context-bound queries must go through the blade/binding path — that's
-      // the only way to score "this content in this context" as one signal.
-      // A context-free query has nothing to preserve orthogonality against,
-      // so score it by full-vector cosine on the un-compressed sphere vector
-      // instead of the grade-1 blade: the blade only keeps NUM_GENERATORS of
-      // SPHERE_DIM dimensions (see clifford.ts), and reranking against the
-      // full vector recovers most of what that compression would otherwise
-      // cost, at no extra asymptotic expense (this loop is already O(N)).
+      // Context-bound queries score via the HRR bind (see hrr.ts and
+      // MemoryRecord.boundHrr) — full SPHERE_DIM circular convolution, no
+      // grade compression, unlike the Clifford blade path this replaced for
+      // scoring (see the README's "Context-bound queries" section for the
+      // measured ~2x nDCG@10 difference). A context-free query has nothing
+      // to bind against, so it scores by full-vector cosine on the raw
+      // sphere vector instead, same as before.
       const similarity = hasContext
-        ? innerProduct(record.boundNorm, qBladeNorm)
+        ? hrrDot(record.boundHrr, queryBoundHrr!)
         : sphereDot(queryVec, record.contentVector);
       const phaseWeight = temporal
         ? gaussian(angularDiff(record.rotorAngle, centerAngle), sigma)

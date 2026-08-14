@@ -18,9 +18,16 @@ import { textToBits } from "./random";
 // dimensions give words more room to stay distinguishable after summation.
 // Diminishing returns set in well before 256 (128→256 was +22% relative,
 // 256→512 was +17% at a much higher cost, and HNSW's approximation gap
-// starts widening past this point too) — this is a deliberate quality/cost
-// balance point, not the ceiling.
-export const SPHERE_DIM = 256;
+// starts widening past this point too).
+//
+// 256 → 384: matches the production/standard embedding width (e.g.
+// OpenAI/Cohere-class models commonly ship 384-dim variants) rather than
+// the 256 the earlier 128/256/512 sweep above happened to land on. This also
+// reopens clifford.ts's Cl(n,0) blade-capacity ceiling (C(n,3) ≤
+// SPHERE_DIM) — n=14 fits capacity-wise now, but was tried and reverted;
+// see clifford.ts for why NUM_GENERATORS is still 12. Content-only nDCG@10
+// (bench/index.ts, NFCorpus): 0.2161 → 0.2361.
+export const SPHERE_DIM = 384;
 
 // A small closed-class stopword list. These carry ~no discriminative signal
 // but show up in nearly every document, so bundling them in unweighted dilutes
