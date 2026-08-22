@@ -263,7 +263,40 @@ pnpm bench [-- --dataset name] [--ann]   # content-only queries, vs. brute-force
                                           #  batch-built ANN index instead of an exact scan —
                                           #  see "Optional: ANN index" below)
 pnpm bench:context                # context-bound queries (NFCorpus only, see below)
+pnpm bench:temporal               # native single-plane vs distributed temporal rotor
 ```
+
+### Distributed temporal rotor experiment
+
+The opt-in `distributed` addressing mode maps time onto the six independent
+commuting bivector planes available in `Cl(12,0)`. Its incommensurate bands
+span roughly 1.4 logical hours to 6.5 years. Ranking uses the rotor as a 5%
+additive tie-break, not as an ordering oracle; exact logical ticks remain
+authoritative. `rotateWithDistributedTimeRotor()` also supports literal
+geometric bind/unbind of field contributions so its cost can be measured
+separately from the ranking signal.
+
+Representative local result (`pnpm bench:temporal`, 576 memories and 576
+queries; three-build median index time):
+
+| Method | Exact version @1 | Semantic family @1 | MRR | 24-tick alias | Index | Avg query |
+|---|---:|---:|---:|---:|---:|---:|
+| Content only | 1.4% | 100.0% | 0.0675 | 2.8% | 730.50ms | 370µs |
+| Native single-plane | 33.3% | 100.0% | 0.6111 | 66.7% | 730.50ms | 329µs |
+| Distributed score only | 100.0% | 100.0% | 1.0000 | 0.0% | 730.50ms | 652µs |
+| Distributed geometric field | 100.0% | 100.0% | 1.0000 | 0.0% | 1429.20ms | 611µs |
+
+The distributed code had no correlation at or above 0.99 for any nonzero
+delta through 100,000 ticks; the worst was 0.984292 at 73,756 ticks. This is
+still a finite phase code, so recurrence is delayed rather than eliminated.
+The controlled result supports the distributed correlation as a useful
+secondary address: it breaks identical-content temporal ties without changing
+the semantic family. It does **not** support rotating every field contribution
+by default: that added no peak-ranking quality here and roughly doubled index
+cost. A 25-query NFCorpus smoke rerun retained the native content metrics
+exactly (nDCG@10 0.2168, Recall@100 0.1006, MRR@10 0.5240), as expected for
+an opt-in temporal path. This synthetic ablation is intentionally narrower
+than a claim about arbitrary temporal reasoning.
 
 ### Content-only queries
 

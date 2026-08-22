@@ -27,8 +27,13 @@ import { hashString } from "./random";
 import { IdfLookup, sphereDot, textToSphereVector } from "./sphere";
 import { ANNIndex } from "./ann";
 import { circularConvolve, dot as hrrDot, normalize as hrrNormalize } from "./hrr";
+import {
+  distributedRotorCorrelation,
+  rotateWithDistributedTimeRotor,
+} from "./temporalRotor";
 
 export type Tier = "recent" | "repeated" | "long-term";
+export type TemporalAddressing = "single" | "distributed";
 
 export interface MemoryRecord {
   id: string;
@@ -223,9 +228,11 @@ export class HoloStore {
   // brute-force/HNSW baselines use — otherwise "same embedding across all
   // three" would stop being true the moment one of them adds IDF.
   private idf?: IdfLookup;
+  private temporalAddressing: TemporalAddressing;
 
-  constructor(opts: { idf?: IdfLookup } = {}) {
+  constructor(opts: { idf?: IdfLookup; temporalAddressing?: TemporalAddressing } = {}) {
     this.idf = opts.idf;
+    this.temporalAddressing = opts.temporalAddressing ?? "single";
   }
   // One multivector per context bucket instead of a single shared field —
   // see NUM_BUCKETS above.
@@ -296,6 +303,12 @@ export class HoloStore {
     return scale(r.rotated, r.weight);
   }
 
+  private rotateAt(bound: Multivector, tick: number): Multivector {
+    return this.temporalAddressing === "distributed"
+      ? rotateWithDistributedTimeRotor(tick, bound)
+      : sandwich(timeRotor(phaseOf(tick)), bound);
+  }
+
   private setWeight(r: MemoryRecord, newWeight: number) {
     const old = this.contribution(r);
     r.weight = newWeight;
@@ -361,7 +374,7 @@ export class HoloStore {
       : new Float64Array(content.sphereVec.length);
     const bucket = bucketOf(context);
     const angle = phaseOf(this.clock);
-    const rotated = sandwich(timeRotor(angle), bound);
+    const rotated = this.rotateAt(bound, this.clock);
     const record: MemoryRecord = {
       id: `m${this.idTag}-${this.nextId++}`,
       text,
@@ -446,7 +459,7 @@ export class HoloStore {
     r.lastSeenTick = this.clock;
     r.rotorAngle = phaseOf(this.clock);
     r.boundNorm = normalize(bound);
-    r.rotated = sandwich(timeRotor(r.rotorAngle), bound);
+    r.rotated = this.rotateAt(bound, this.clock);
     r.boundHrr = boundHrr;
 
     if (r.repeatCount >= PROMOTE_TO_LONG_TERM_AT) {
@@ -494,6 +507,8 @@ export class HoloStore {
       topK?: number;
       centerTick?: number;
       temporal?: boolean;
+      temporalAddressing?: TemporalAddressing;
+      rotorWeight?: number;
       globalResonance?: boolean;
     } = {}
   ): RetrievalResult {
@@ -515,6 +530,8 @@ export class HoloStore {
     // similarity should win a plain search; the Gaussian phase window is a
     // deliberate extra filter for "what happened around this time".
     const temporal = opts.temporal ?? false;
+    const temporalAddressing = opts.temporalAddressing ?? this.temporalAddressing;
+    const rotorWeight = Math.max(0, Math.min(opts.rotorWeight ?? 0.05, 0.2));
 
     // Lean query-side encode (encodeQuery/encodeContextQuery): retrieve()
     // never reads .spectrum or .point3d, so it skips computing them — see
@@ -553,9 +570,14 @@ export class HoloStore {
       const targetField = hasContext
         ? this.field[bucketOf(queryContext)]
         : this.field.reduce((acc, f) => add(acc, f), mv());
-      correlation = gp(targetField, reverse(qBlade));
+      // A temporal probe must be bound at the requested center before
+      // correlation. Multiplication by its reverse is the unbind operation:
+      // contributions stored under the same rotor collapse back toward the
+      // query, while different temporal addresses remain rotated away.
+      const fieldProbe = temporal ? this.rotateAt(qBlade, centerTick) : qBlade;
+      correlation = gp(targetField, reverse(fieldProbe));
       const fieldMag = magnitude(targetField) || 1;
-      const qMag = magnitude(qBlade) || 1;
+      const qMag = magnitude(fieldProbe) || 1;
       globalResonance = (correlation.get(0) ?? 0) / (fieldMag * qMag);
     }
 
@@ -616,9 +638,20 @@ export class HoloStore {
         ? hrrDot(record.boundHrr, queryBoundHrr!)
         : sphereDot(queryVec, record.contentVector);
       const phaseWeight = temporal
-        ? gaussian(angularDiff(record.rotorAngle, centerAngle), sigma)
+        ? temporalAddressing === "distributed"
+          ? distributedRotorCorrelation(record.createdAtTick, centerTick).coherence
+          : gaussian(angularDiff(record.rotorAngle, centerAngle), sigma)
         : 1;
-      const score = similarity * phaseWeight * Math.sqrt(record.weight);
+      const semanticScore = similarity * Math.sqrt(record.weight);
+      // Preserve Alex's multiplicative single-plane behavior exactly.  The
+      // distributed rotor follows HAM's safer policy: a small additive
+      // secondary signal, so time can break semantic ties without erasing a
+      // materially better content match.
+      const score = !temporal
+        ? semanticScore
+        : temporalAddressing === "distributed"
+          ? (1 - rotorWeight) * semanticScore + rotorWeight * phaseWeight
+          : semanticScore * phaseWeight;
       return { record, similarity, phaseWeight, score };
     });
     peaks.sort((a, b) => b.score - a.score);
@@ -628,7 +661,9 @@ export class HoloStore {
       // returned Peak.phaseWeight is always accurate (e.g. for the UI's
       // "phase wt" display) even though it played no part in ranking here.
       for (const p of top) {
-        p.phaseWeight = gaussian(angularDiff(p.record.rotorAngle, centerAngle), sigma);
+        p.phaseWeight = temporalAddressing === "distributed"
+          ? distributedRotorCorrelation(p.record.createdAtTick, centerTick).coherence
+          : gaussian(angularDiff(p.record.rotorAngle, centerAngle), sigma);
       }
     }
 

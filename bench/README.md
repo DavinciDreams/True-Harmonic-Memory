@@ -31,6 +31,7 @@ pnpm bench -- --ann                     # opt the holographic engine into its ba
                                          # README's "Optional: ANN index" section
 pnpm bench -- --ann --ann-m 12 --ann-ef 60   # override ann.ts's M/efConstruction defaults
 pnpm bench:context                       # context-bound queries (NFCorpus-specific, see below)
+pnpm bench:temporal                      # native 24-tick phase vs distributed six-plane rotor
 pnpm bench:fetch:glove                   # optional: ~171MB, adds a 4th "real embedding" row to pnpm bench
 ```
 
@@ -71,3 +72,16 @@ demo's recent-ring eviction, dedup/reinforcement, and decay — those model
 working memory and would otherwise evict most of a multi-thousand-doc corpus
 by design. Bulk-loading indexes it as a permanent store instead, which is
 the fair comparison against the other two methods.
+
+## Temporal rotor ablation
+
+`pnpm bench:temporal` is self-contained and does not ingest arbitrary
+external documents. It stores 72 byte-identical versions of each of eight
+semantic families at consecutive logical ticks. Content similarity can select
+the family but cannot select the version, so the benchmark isolates temporal
+addressing and makes the native single-plane rotor's exact 24-tick recurrence
+visible. It compares no temporal signal, the native Gaussian phase window,
+a six-plane incommensurate HAM-style correlation over Alex's native field,
+and the same correlation with every field contribution geometrically rotated
+across all six planes. This separates ranking value from field-construction
+cost. Exact ticks are the oracle; the rotor remains a fuzzy secondary signal.

@@ -10,7 +10,9 @@
     "bench:fetch": "bash bench/fetch-data.sh",
     "bench:fetch:glove": "bash bench/fetch-glove.sh",
     "bench": "tsx bench/index.ts",
-    "bench:context": "tsx bench/context.ts"
+    "bench:context": "tsx bench/context.ts",
+    "bench:temporal": "tsx bench/temporal.ts",
+    "test:temporal": "node --import tsx tests/temporalRotor.test.ts"
   },
   "dependencies": {
     "next": "16.3.0",
