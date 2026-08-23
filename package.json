@@ -12,7 +12,9 @@
     "bench": "tsx bench/index.ts",
     "bench:context": "tsx bench/context.ts",
     "bench:temporal": "tsx bench/temporal.ts",
-    "test:temporal": "node --import tsx tests/temporalRotor.test.ts"
+    "test:temporal": "node --import tsx tests/temporalRotor.test.ts",
+    "bench:true-harmonic": "node --import tsx bench/trueHarmonic.ts",
+    "test:true-harmonic": "node --import tsx tests/trueHarmonic.test.ts"
   },
   "dependencies": {
     "next": "16.3.0",

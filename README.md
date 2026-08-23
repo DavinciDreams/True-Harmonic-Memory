@@ -100,6 +100,7 @@ src/lib/holo/
   projection.ts    sphere vector -> 3D point (visualization)
   engine.ts        HoloStore: binding, bucketed field, tiers, retrieval
   ann.ts           optional ANN index for content-only retrieval (opt-in, see Benchmark)
+  trueHarmonic.ts  separate reversible byte/QPSK/temporal-harmonic experiment
 
 src/components/holo/
   HoloApp.tsx        main UI: add/search/inspect memories
@@ -247,6 +248,48 @@ src/components/holo/
   multi-word one. `hadamard()` is kept in `src/lib/holo/hrr.ts`, unused, as
   a documented dead end — see its doc comment for the full derivation.
   Not integrated into `HoloStore`.
+
+## Experiment: reversible wire + temporal harmonics
+
+`src/lib/holo/trueHarmonic.ts` explores a separate, full-fidelity memory
+substrate. It does **not** replace or silently alter the hash → sphere →
+Clifford engine above. Instead, literal bytes are framed with length and
+CRC32, optionally protected with Hamming(7,4), Gray-QPSK modulated, and bound
+to time on an independent Fourier axis:
+
+```
+F[h, d] = Σᵢ exp(-2π i kₕ tᵢ/T) Wᵢ[d]
+```
+
+This makes two retrieval directions mechanical rather than metaphorical:
+
+- time → content: conjugate the temporal rotor, contract the harmonic axis,
+  demodulate the QPSK wire, and validate the exact bytes with CRC32;
+- content → time: contract the wire axis with an exact or partial byte probe,
+  then IFFT the temporal coefficients to expose matching ticks.
+
+Run the deterministic checks and coefficient-budget benchmark with:
+
+```bash
+pnpm test:true-harmonic
+pnpm bench:true-harmonic
+```
+
+At 128 random 32-byte records, a complete basis recovered 100% of timestamps
+and CRC-valid payloads with or without FEC. At the same coefficient count over
+a 4096-tick partial basis, timestamp search remained 100% but CRC recovery fell
+to 0%. A related-record shared-prefix probe also fails to recover every true
+tick in the partial field. Those are the intended controls: a complete basis
+provides exact discrete separation only up to its independent temporal-mode
+capacity; an undersampled basis is a useful approximate search surface whose
+global sidelobes are not repaired merely by renaming them as geometry or by
+adding packet-level FEC.
+
+This experiment adds exact preservation and field-native temporal lookup that
+the semantic engine does not attempt. Conversely, it supplies no learned or
+hash-bundle semantics: natural-language similarity remains the existing
+engine's job. A hybrid should therefore compare or compose the two result
+lanes, not claim that either one is a drop-in improvement to the other.
 
 ## Benchmark: vs. normal RAG
 
