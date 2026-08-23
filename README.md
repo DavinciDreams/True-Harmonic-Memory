@@ -337,6 +337,57 @@ magnitude faster. The divergence between needlet and diffusion results is also
 evidence that interference is structured—different localized frames expose or
 suppress different signals—rather than uniformly meaningless noise.
 
+### Temporal reasoning capability control
+
+`HoloStore` already has logical ticks, a timestamp rotor, and optional Gaussian
+phase weighting. That supports “retrieve near this phase,” but the phase repeats
+every 24 ticks and the query API has no before/after, elapsed-time, interval,
+sequence, recurrence, or state-at-time operators. The separate wire experiment
+can derive those relations from content→time evidence while retaining pointers
+to CRC-verifiable payloads.
+
+Run the deterministic 96-tick control with:
+
+```bash
+pnpm bench:true-harmonic:temporal
+```
+
+The fixture contains 82 distractors, four identical heartbeat events exactly
+24 ticks apart, a before/after pair, interval anchors, and a declared deployment
+state lineage. The non-wrapping rotor timeline passed all nine capabilities:
+near-time, distinct epochs, before, elapsed ticks, between, ordered sequence,
+recurrence, state-at-time, and latest declared superseding state. Ten sampled
+payloads recovered with valid CRC. Alex's current API passed ordinary near-time
+ranking, returned tick 11 for a query centered on the phase-identical tick 83,
+and does not expose the remaining seven relational operators.
+
+The same control also measures faithful versus routed temporal evidence over
+four non-overlapping 24-tick epoch shards. Approximate single-run CPU/TypeScript
+points were:
+
+| Temporal evidence mode | Epochs searched | Capabilities | Avg evidence query |
+|---|---:|---:|---:|
+| One global non-wrapping field | all | 9/9 | 6.2ms |
+| Needlet + diffusion route | 2/4 | 6/9 | 3.17ms |
+| Needlet + diffusion route | 3/4 | 8/9 | 3.77ms |
+| Four smaller exact epoch FFTs | 4/4 | 9/9 | 4.76ms |
+
+At 2/4 epochs the router omitted part of the deployment sequence, two heartbeat
+epochs, and the latest state; at 3/4 it recovered everything except the complete
+recurrence count. Those are explicit candidate false negatives, not approximate
+payload corruption. Searching all four smaller FFTs was both faithful and faster
+than the single large field in this small control, echoing the NFCorpus result
+that one global FFT is not automatically the fastest exact representation.
+Queries with a supplied time center can select the containing epoch directly;
+the fuzzy routing tradeoff applies when content must discover unknown epochs.
+
+The initial occurrence threshold of 0.75 admitted one unrelated short-cue
+collision at 0.7526; exact/prefix evidence scored ~1.0, so the reported control
+uses an explicit 0.9 evidence threshold and passes 9/9. This is deliberately an
+evidence-bound benchmark, not a claim that time order implies causality. The
+deployment records are declared to share a state lineage; supersession is not
+inferred merely because one record is later.
+
 The separable control retains the earlier capacity result: at 128 random
 32-byte records a complete basis recovered 100% of timestamps and CRC-valid
 payloads; a same-coefficient partial 4096-tick basis kept timestamp search at

@@ -15,6 +15,7 @@
     "test:temporal": "node --import tsx tests/temporalRotor.test.ts",
     "bench:true-harmonic": "node --import tsx bench/trueHarmonic.ts",
     "bench:true-harmonic:nfcorpus": "node --import tsx bench/trueHarmonicNfcorpus.ts",
+    "bench:true-harmonic:temporal": "node --import tsx bench/trueHarmonicTemporal.ts",
     "test:true-harmonic": "node --import tsx tests/trueHarmonic.test.ts"
   },
   "dependencies": {
