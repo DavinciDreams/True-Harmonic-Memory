@@ -255,35 +255,59 @@ src/components/holo/
 substrate. It does **not** replace or silently alter the hash → sphere →
 Clifford engine above. Instead, literal bytes are framed with length and
 CRC32, optionally protected with Hamming(7,4), Gray-QPSK modulated, and bound
-to time on an independent Fourier axis:
+directly to a timestamp rotor. In a single wire field:
 
 ```
-F[h, d] = Σᵢ exp(-2π i kₕ tᵢ/T) Wᵢ[d]
+F[k] = Σᵢ FFT(Wᵢ)[k] exp(-2π i k tᵢ/N)
 ```
 
 This makes two retrieval directions mechanical rather than metaphorical:
 
-- time → content: conjugate the temporal rotor, contract the harmonic axis,
-  demodulate the QPSK wire, and validate the exact bytes with CRC32;
-- content → time: contract the wire axis with an exact or partial byte probe,
-  then IFFT the temporal coefficients to expose matching ticks.
+- time → content: reverse the rotor/circular shift, demodulate the QPSK wire,
+  and validate the exact bytes with CRC32;
+- content → time: conjugate-multiply the field spectrum by an exact or partial
+  probe spectrum, then IFFT once to expose matching offsets.
 
-Run the deterministic checks and coefficient-budget benchmark with:
+`DirectRotorWireField` writes non-overlapping frames locally in the time
+domain and batches their mathematically equivalent rotor bindings into one
+FFT per query-ready snapshot. `SeparableHarmonicWireField` retains the more
+expensive independent time/content matrix as an exact-overlap control, not as
+the default architecture.
+
+Run the deterministic checks, controlled basis benchmark, and same-corpus
+comparison with:
 
 ```bash
 pnpm test:true-harmonic
 pnpm bench:true-harmonic
+pnpm bench:true-harmonic:nfcorpus -- --queries 60
 ```
 
-At 128 random 32-byte records, a complete basis recovered 100% of timestamps
-and CRC-valid payloads with or without FEC. At the same coefficient count over
-a 4096-tick partial basis, timestamp search remained 100% but CRC recovery fell
-to 0%. A related-record shared-prefix probe also fails to recover every true
-tick in the partial field. Those are the intended controls: a complete basis
-provides exact discrete separation only up to its independent temporal-mode
-capacity; an undersampled basis is a useful approximate search surface whose
-global sidelobes are not repaired merely by renaming them as geometry or by
-adding packet-level FEC.
+On all 3,633 NFCorpus documents (5.79MB of literal UTF-8), 90 × 262,144-symbol
+fields took 1.14s to encode/place and 0.87s to prepare spectra: 2.01s
+query-ready versus 7.32s for `HoloStore` indexing in the same process. Thirty-
+two sampled time-addressed reads were 100% CRC-valid. A 64-byte prefix probe
+ranked its source first. The cost is global search: exhaustive byte-wave
+correlation averaged 1.00s/query versus 2.14ms for `HoloStore` on 60 evenly
+spaced judged queries.
+
+| Method (60-query sample) | nDCG@10 | Recall@100 | MRR@10 | Avg query |
+|---|---:|---:|---:|---:|
+| Direct rotor, exhaustive | 0.1788 | **0.1823** | 0.2934 | 1002.5ms |
+| `HoloStore` | **0.2508** | 0.1797 | **0.4432** | **2.14ms** |
+
+Two acceleration controls were rejected rather than promoted. One exact
+33,554,432-symbol global harmonic superposition took 3.82s to become query-
+ready and about 5.4s/query—roughly 5× slower than the smaller FFTs. A lossy
+128-band magnitude/rotor router cut search to about 100ms, but missed the
+known prefix shard and fell to 0.0599 nDCG@10. A useful router must retain
+phase/locality or use another query-conditioned coarse representation.
+
+The separable control retains the earlier capacity result: at 128 random
+32-byte records a complete basis recovered 100% of timestamps and CRC-valid
+payloads; a same-coefficient partial 4096-tick basis kept timestamp search at
+100% while CRC recovery fell to 0%. Packet-level FEC does not create missing
+independent time modes.
 
 This experiment adds exact preservation and field-native temporal lookup that
 the semantic engine does not attempt. Conversely, it supplies no learned or

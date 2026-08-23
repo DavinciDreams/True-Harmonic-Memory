@@ -30,6 +30,11 @@ export interface HarmonicSearchHit {
   score: number;
 }
 
+export interface PreparedWireProbe {
+  spectrum: Float64Array;
+  symbolCount: number;
+}
+
 function assertBinary(values: Uint8Array): void {
   for (const value of values) {
     if (value > 1) throw new Error("bits must contain only zero or one");
@@ -107,8 +112,15 @@ function qpskDemodulate(symbols: Float64Array): { bits: Uint8Array; meanMargin: 
   return { bits: output, meanMargin: symbols.length ? margin / (symbols.length / 2) : 0 };
 }
 
-function symbolsPerByte(fec: boolean): number {
+export function symbolsPerByte(fec: boolean): number {
   return fec ? 7 : 4;
+}
+
+export function wireFrameSymbolLength(payloadBytes: number, fec = true): number {
+  if (!Number.isInteger(payloadBytes) || payloadBytes < 0) {
+    throw new Error("payloadBytes must be a non-negative integer");
+  }
+  return (HEADER_BYTES + payloadBytes) * symbolsPerByte(fec);
 }
 
 export function wireEncodePayload(data: Uint8Array, fec = true): Float64Array {
@@ -209,12 +221,11 @@ export function wireDecodeFrame(
   };
 }
 
-function fft(data: Float64Array, inverse = false): Float64Array {
-  const length = data.length / 2;
+function fftInPlace(output: Float64Array, inverse = false): void {
+  const length = output.length / 2;
   if (!Number.isInteger(length) || length < 1 || (length & (length - 1)) !== 0) {
     throw new Error("FFT length must be a positive power of two");
   }
-  const output = data.slice();
   for (let index = 1, reversed = 0; index < length; index++) {
     let bit = length >>> 1;
     for (; reversed & bit; bit >>>= 1) reversed ^= bit;
@@ -257,7 +268,241 @@ function fft(data: Float64Array, inverse = false): Float64Array {
   if (inverse) {
     for (let index = 0; index < output.length; index++) output[index] /= length;
   }
+}
+
+function fft(data: Float64Array, inverse = false): Float64Array {
+  const output = data.slice();
+  fftInPlace(output, inverse);
   return output;
+}
+
+function normalizedMagnitudeSketch(spectrum: Float64Array, bands: number): Float64Array {
+  const frequencies = spectrum.length / 2;
+  if (!Number.isInteger(bands) || bands < 1 || bands > frequencies) {
+    throw new Error("sketch bands must be in [1, spectrum frequencies]");
+  }
+  const sketch = new Float64Array(bands);
+  for (let frequency = 0; frequency < frequencies; frequency++) {
+    const band = Math.min(bands - 1, Math.floor(frequency * bands / frequencies));
+    const real = spectrum[2 * frequency];
+    const imag = spectrum[2 * frequency + 1];
+    sketch[band] += real * real + imag * imag;
+  }
+  let norm = 0;
+  for (let band = 0; band < bands; band++) {
+    sketch[band] = Math.sqrt(sketch[band]);
+    norm += sketch[band] * sketch[band];
+  }
+  norm = Math.sqrt(norm);
+  if (norm > 0) for (let band = 0; band < bands; band++) sketch[band] /= norm;
+  return sketch;
+}
+
+/**
+ * Lossy magnitude/rotor routing control over superposed shard spectra.
+ * The NFCorpus benchmark currently rejects it for promotion: it is fast but
+ * discards enough phase/locality to miss even a known 64-byte prefix shard.
+ */
+export class HarmonicShardRouter {
+  readonly size: number;
+  private readonly field: Float64Array;
+  private entries = 0;
+
+  constructor(size: number) {
+    if (!Number.isInteger(size) || size < 1 || (size & (size - 1)) !== 0) {
+      throw new Error("router size must be a positive power of two");
+    }
+    this.size = size;
+    this.field = new Float64Array(size * 2);
+  }
+
+  add(sketch: Float64Array, address = this.entries): void {
+    if (sketch.length !== this.size || !Number.isInteger(address) || address < 0 || address >= this.size) {
+      throw new Error("sketch and address must fit the router");
+    }
+    for (let band = 0; band < this.size; band++) {
+      const angle = -2 * Math.PI * band * address / this.size;
+      this.field[2 * band] += sketch[band] * Math.cos(angle);
+      this.field[2 * band + 1] += sketch[band] * Math.sin(angle);
+    }
+    this.entries = Math.max(this.entries, address + 1);
+  }
+
+  route(querySketch: Float64Array, topK = 5): HarmonicSearchHit[] {
+    if (querySketch.length !== this.size || !Number.isInteger(topK) || topK < 1) {
+      throw new Error("query sketch must fit and topK must be positive");
+    }
+    const correlation = new Float64Array(this.field.length);
+    for (let band = 0; band < this.size; band++) {
+      correlation[2 * band] = this.field[2 * band] * querySketch[band];
+      correlation[2 * band + 1] = this.field[2 * band + 1] * querySketch[band];
+    }
+    fftInPlace(correlation, true);
+    const candidates = Array.from({ length: this.entries }, (_, address) => ({
+      timeTick: address,
+      score: correlation[2 * address],
+    }));
+    candidates.sort((left, right) => right.score - left.score);
+    return candidates.slice(0, Math.min(topK, candidates.length));
+  }
+}
+
+/**
+ * One-axis rotor field. A timestamp is a circular shift of the QPSK wire;
+ * in frequency space the same operation is multiplication by a phase rotor.
+ * Writes stay local in the time-domain field, and prepareSpectrum() batches
+ * the equivalent rotor bindings into one FFT for content-to-time search.
+ */
+export class DirectRotorWireField {
+  readonly horizonSamples: number;
+  readonly maxPayloadBytes: number;
+  readonly fec: boolean;
+  private readonly timeField: Float64Array;
+  private fieldSpectrum: Float64Array | null = null;
+
+  constructor(options: { horizonSamples: number; maxPayloadBytes: number; fec?: boolean }) {
+    const { horizonSamples, maxPayloadBytes, fec = true } = options;
+    if (
+      !Number.isInteger(horizonSamples) || horizonSamples < 1 ||
+      (horizonSamples & (horizonSamples - 1)) !== 0
+    ) {
+      throw new Error("horizonSamples must be a positive power of two");
+    }
+    if (!Number.isInteger(maxPayloadBytes) || maxPayloadBytes < 1) {
+      throw new Error("maxPayloadBytes must be positive");
+    }
+    if (wireFrameSymbolLength(maxPayloadBytes, fec) > horizonSamples) {
+      throw new Error("maximum frame must fit inside the field horizon");
+    }
+    this.horizonSamples = horizonSamples;
+    this.maxPayloadBytes = maxPayloadBytes;
+    this.fec = fec;
+    this.timeField = new Float64Array(horizonSamples * 2);
+  }
+
+  get headerSymbols(): number {
+    return HEADER_BYTES * symbolsPerByte(this.fec);
+  }
+
+  get storageBytes(): number {
+    return this.timeField.byteLength + (this.fieldSpectrum?.byteLength ?? 0);
+  }
+
+  add(data: Uint8Array, offset: number, weight = 1): void {
+    if (data.length > this.maxPayloadBytes) throw new Error("payload exceeds configured maximum");
+    if (!Number.isInteger(offset)) throw new Error("offset must be an integer symbol coordinate");
+    if (!Number.isFinite(weight)) throw new Error("weight must be finite");
+    const frame = wireEncodeFrame(data, this.fec);
+    const start = ((offset % this.horizonSamples) + this.horizonSamples) % this.horizonSamples;
+    for (let symbol = 0; symbol < frame.length / 2; symbol++) {
+      const target = (start + symbol) % this.horizonSamples;
+      this.timeField[2 * target] += weight * frame[2 * symbol];
+      this.timeField[2 * target + 1] += weight * frame[2 * symbol + 1];
+    }
+    this.fieldSpectrum = null;
+  }
+
+  subtract(data: Uint8Array, offset: number, weight = 1): void {
+    this.add(data, offset, -weight);
+  }
+
+  readWave(offset: number, symbolCount = wireFrameSymbolLength(this.maxPayloadBytes, this.fec)): Float64Array {
+    if (!Number.isInteger(offset) || !Number.isInteger(symbolCount) || symbolCount < 1) {
+      throw new Error("offset and symbolCount must be valid integers");
+    }
+    const output = new Float64Array(symbolCount * 2);
+    const start = ((offset % this.horizonSamples) + this.horizonSamples) % this.horizonSamples;
+    for (let symbol = 0; symbol < symbolCount; symbol++) {
+      const source = (start + symbol) % this.horizonSamples;
+      output[2 * symbol] = this.timeField[2 * source];
+      output[2 * symbol + 1] = this.timeField[2 * source + 1];
+    }
+    return output;
+  }
+
+  readPacket(offset: number): WireDecodeResult {
+    return wireDecodeFrame(
+      this.readWave(offset),
+      this.fec,
+      this.maxPayloadBytes,
+    );
+  }
+
+  prepareSpectrum(): void {
+    this.fieldSpectrum = fft(this.timeField);
+  }
+
+  prepareProbe(probe: Uint8Array): PreparedWireProbe {
+    if (probe.length === 0) throw new Error("probe cannot be empty");
+    const wire = wireEncodePayload(probe, this.fec);
+    if (wire.length / 2 > this.horizonSamples) throw new Error("probe exceeds field horizon");
+    const spectrum = new Float64Array(this.horizonSamples * 2);
+    spectrum.set(wire);
+    fftInPlace(spectrum);
+    return { spectrum, symbolCount: wire.length / 2 };
+  }
+
+  spectrumSketch(bands: number): Float64Array {
+    if (!this.fieldSpectrum) throw new Error("call prepareSpectrum() after the last write");
+    return normalizedMagnitudeSketch(this.fieldSpectrum, bands);
+  }
+
+  probeSketch(probe: PreparedWireProbe, bands: number): Float64Array {
+    if (probe.spectrum.length !== this.horizonSamples * 2) {
+      throw new Error("probe was prepared for a different field horizon");
+    }
+    return normalizedMagnitudeSketch(probe.spectrum, bands);
+  }
+
+  correlationPrepared(probe: PreparedWireProbe): Float64Array {
+    if (!this.fieldSpectrum) throw new Error("call prepareSpectrum() after the last write");
+    if (probe.spectrum.length !== this.fieldSpectrum.length || probe.symbolCount < 1) {
+      throw new Error("probe was prepared for a different field horizon");
+    }
+    const product = new Float64Array(this.fieldSpectrum.length);
+    for (let frequency = 0; frequency < this.horizonSamples; frequency++) {
+      const fieldReal = this.fieldSpectrum[2 * frequency];
+      const fieldImag = this.fieldSpectrum[2 * frequency + 1];
+      const probeReal = probe.spectrum[2 * frequency];
+      const probeImag = probe.spectrum[2 * frequency + 1];
+      product[2 * frequency] = fieldReal * probeReal + fieldImag * probeImag;
+      product[2 * frequency + 1] = fieldImag * probeReal - fieldReal * probeImag;
+    }
+    fftInPlace(product, true);
+    for (let index = 0; index < product.length; index++) product[index] /= probe.symbolCount;
+    return product;
+  }
+
+  correlation(probe: Uint8Array): Float64Array {
+    return this.correlationPrepared(this.prepareProbe(probe));
+  }
+
+  search(probe: Uint8Array, topK = 5): HarmonicSearchHit[] {
+    if (!Number.isInteger(topK) || topK < 1) throw new Error("topK must be positive");
+    const correlation = this.correlation(probe);
+    const scores = new Float64Array(this.horizonSamples);
+    for (let offset = 0; offset < this.horizonSamples; offset++) {
+      scores[offset] = Math.hypot(correlation[2 * offset], correlation[2 * offset + 1]);
+    }
+    const hits: HarmonicSearchHit[] = [];
+    const suppression = Math.max(1, Math.floor(wireEncodePayload(probe, this.fec).length / 4));
+    for (let rank = 0; rank < Math.min(topK, this.horizonSamples); rank++) {
+      let bestOffset = 0;
+      let bestScore = -Infinity;
+      for (let offset = 0; offset < scores.length; offset++) {
+        if (scores[offset] > bestScore) {
+          bestOffset = offset;
+          bestScore = scores[offset];
+        }
+      }
+      if (!Number.isFinite(bestScore)) break;
+      hits.push({ timeTick: (bestOffset - this.headerSymbols + this.horizonSamples) % this.horizonSamples, score: bestScore });
+      for (let delta = -suppression; delta <= suppression; delta++) {
+        scores[(bestOffset + delta + this.horizonSamples) % this.horizonSamples] = -Infinity;
+      }
+    }
+    return hits;
+  }
 }
 
 function chooseFrequencyIndices(horizon: number, bands: number, seed: number): Uint32Array {
