@@ -303,6 +303,40 @@ ready and about 5.4s/query—roughly 5× slower than the smaller FFTs. A lossy
 known prefix shard and fell to 0.0599 nDCG@10. A useful router must retain
 phase/locality or use another query-conditioned coarse representation.
 
+The next bake-off keeps complex phase and tests 1,024-coefficient localized
+projections per shard: uniform sparse Fourier samples, a leading DPSS/Slepian
+taper, periodic needlet-style bands, cycle-graph diffusion-wavelet bands, and
+Gabor windows. Each reduced inverse FFT routes to candidate shards; the exact
+full-resolution FFT still scores records inside those shards. The router adds
+only 5.6–8.4MiB for the promoted variants. Use `--router-power`,
+`--route-shards`, and `--router-kinds` to reproduce other points, for example:
+
+```bash
+pnpm bench:true-harmonic:nfcorpus -- --queries 60 --router-power 10 \
+  --route-shards 32 --router-kinds needlet,diffusion
+```
+
+On the established 60-query sample, diffusion was the strongest natural-query
+router while the needlet-style bank was the only one to retain the known
+64-byte prefix reliably. Reserving eight of 32 candidates for needlets and
+filling the rest from diffusion produced the best current combined result:
+
+| Method | Prefix | nDCG@10 | Recall@100 | MRR@10 | Avg query |
+|---|:---:|---:|---:|---:|---:|
+| Direct rotor, exhaustive | #1 | **0.1788** | **0.1823** | 0.2934 | 983.4ms |
+| Needlet-style, 32/90 shards | #1 | 0.1137 | 0.0815 | 0.2146 | 384.2ms |
+| Diffusion, 32/90 shards | miss | 0.1535 | 0.1145 | **0.3251** | **375.8ms** |
+| Needlet + diffusion, 8 + 24 | #1 | 0.1492 | 0.1180 | 0.3054 | 397.2ms |
+| `HoloStore` | n/a | 0.2508 | 0.1797 | 0.4432 | 2.68ms |
+
+The hybrid is about 2.5× faster than exhaustive wire correlation, retains 83%
+of its nDCG and 65% of its Recall@100, slightly improves MRR, and preserves the
+sharp prefix case. That makes it the best surviving wire-router configuration,
+not a replacement for `HoloStore`: semantic retrieval remains two orders of
+magnitude faster. The divergence between needlet and diffusion results is also
+evidence that interference is structured—different localized frames expose or
+suppress different signals—rather than uniformly meaningless noise.
+
 The separable control retains the earlier capacity result: at 128 random
 32-byte records a complete basis recovered 100% of timestamps and CRC-valid
 payloads; a same-coefficient partial 4096-tick basis kept timestamp search at

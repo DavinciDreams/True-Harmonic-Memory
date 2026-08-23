@@ -3,12 +3,12 @@
  *
  * This is deliberately separate from the hash -> sphere -> Clifford engine.
  * Literal bytes are framed, optionally Hamming(7,4)-coded, Gray-QPSK modulated,
- * and bound to time on an independent Fourier axis:
+ * and bound directly to a timestamp rotor in one Fourier field:
  *
- *   F[h, d] = sum_i exp(-2 pi i k_h t_i / T) W_i[d]
+ *   F[k] = sum_i FFT(W_i)[k] exp(-2 pi i k t_i / N)
  *
- * A complete temporal basis separates unique ticks exactly. A partial basis is
- * an approximate search surface with global temporal sidelobes.
+ * Direct circular placement is the equivalent time-domain implementation.
+ * The separable temporal-mode/payload matrix below is retained as a control.
  */
 
 import { mulberry32 } from "./random";
@@ -34,6 +34,13 @@ export interface PreparedWireProbe {
   spectrum: Float64Array;
   symbolCount: number;
 }
+
+export type LocalizedSpectralRouterKind =
+  | "sparse-fourier"
+  | "needlet"
+  | "slepian"
+  | "diffusion"
+  | "gabor";
 
 function assertBinary(values: Uint8Array): void {
   for (const value of values) {
@@ -454,6 +461,22 @@ export class DirectRotorWireField {
     return normalizedMagnitudeSketch(probe.spectrum, bands);
   }
 
+  projectSpectrum(frequencies: Uint32Array, amplitudes: Float64Array): Float64Array {
+    if (!this.fieldSpectrum) throw new Error("call prepareSpectrum() after the last write");
+    return projectComplexSpectrum(this.fieldSpectrum, frequencies, amplitudes);
+  }
+
+  projectProbe(
+    probe: PreparedWireProbe,
+    frequencies: Uint32Array,
+    amplitudes: Float64Array,
+  ): Float64Array {
+    if (probe.spectrum.length !== this.horizonSamples * 2) {
+      throw new Error("probe was prepared for a different field horizon");
+    }
+    return projectComplexSpectrum(probe.spectrum, frequencies, amplitudes);
+  }
+
   correlationPrepared(probe: PreparedWireProbe): Float64Array {
     if (!this.fieldSpectrum) throw new Error("call prepareSpectrum() after the last write");
     if (probe.spectrum.length !== this.fieldSpectrum.length || probe.symbolCount < 1) {
@@ -502,6 +525,231 @@ export class DirectRotorWireField {
       }
     }
     return hits;
+  }
+}
+
+function projectComplexSpectrum(
+  spectrum: Float64Array,
+  frequencies: Uint32Array,
+  amplitudes: Float64Array,
+): Float64Array {
+  if (frequencies.length !== amplitudes.length) {
+    throw new Error("frequency and amplitude projections must have the same length");
+  }
+  const horizon = spectrum.length / 2;
+  const output = new Float64Array(frequencies.length * 2);
+  for (let index = 0; index < frequencies.length; index++) {
+    const frequency = frequencies[index];
+    if (frequency >= horizon || !Number.isFinite(amplitudes[index])) {
+      throw new Error("invalid spectral projection");
+    }
+    output[2 * index] = spectrum[2 * frequency] * amplitudes[index];
+    output[2 * index + 1] = spectrum[2 * frequency + 1] * amplitudes[index];
+  }
+  return output;
+}
+
+function normalizeWindow(window: Float64Array): Float64Array {
+  let maximum = 0;
+  for (const value of window) maximum = Math.max(maximum, Math.abs(value));
+  if (maximum === 0) return window;
+  for (let index = 0; index < window.length; index++) {
+    // Each stored/query projection receives sqrt(window), so their product
+    // applies the desired non-negative spectral window once.
+    window[index] = Math.sqrt(Math.max(0, window[index] / maximum));
+  }
+  return window;
+}
+
+/** Leading DPSS eigenvector from the standard symmetric tridiagonal form. */
+function slepianWindow(length: number, timeBandwidth = 2.5): Float64Array {
+  const halfBandwidth = timeBandwidth / length;
+  const diagonal = new Float64Array(length);
+  const offDiagonal = new Float64Array(Math.max(0, length - 1));
+  for (let index = 0; index < length; index++) {
+    const centered = (length - 1 - 2 * index) / 2;
+    diagonal[index] = centered * centered * Math.cos(2 * Math.PI * halfBandwidth);
+    if (index + 1 < length) offDiagonal[index] = (index + 1) * (length - index - 1) / 2;
+  }
+  const vector = new Float64Array(length).fill(1 / Math.sqrt(length));
+  const next = new Float64Array(length);
+  // A positive shift makes the power iteration target the leading eigenpair.
+  const shift = length * length;
+  for (let iteration = 0; iteration < 80; iteration++) {
+    let norm = 0;
+    for (let index = 0; index < length; index++) {
+      const value = (diagonal[index] + shift) * vector[index]
+        + (index > 0 ? offDiagonal[index - 1] * vector[index - 1] : 0)
+        + (index + 1 < length ? offDiagonal[index] * vector[index + 1] : 0);
+      next[index] = value;
+      norm += value * value;
+    }
+    norm = Math.sqrt(norm);
+    for (let index = 0; index < length; index++) vector[index] = next[index] / norm;
+  }
+  return normalizeWindow(vector);
+}
+
+function localizedWindows(
+  kind: LocalizedSpectralRouterKind,
+  frequencies: Uint32Array,
+  horizon: number,
+): Float64Array[] {
+  const length = frequencies.length;
+  if (kind === "sparse-fourier") return [new Float64Array(length).fill(1)];
+  if (kind === "slepian") return [slepianWindow(length)];
+
+  const normalizedFrequency = (index: number): number => {
+    const frequency = frequencies[index];
+    return 2 * Math.min(frequency, horizon - frequency) / horizon;
+  };
+  if (kind === "diffusion") {
+    const times = [0.5, 2, 8];
+    const heat = times.map((time) => Float64Array.from(frequencies, (frequency) => {
+      const eigenvalue = 4 * Math.sin(Math.PI * frequency / horizon) ** 2;
+      return Math.exp(-time * eigenvalue);
+    }));
+    const windows = [
+      Float64Array.from(heat[2]),
+      Float64Array.from(heat[1], (value, index) => Math.max(0, value - heat[2][index])),
+      Float64Array.from(heat[0], (value, index) => Math.max(0, value - heat[1][index])),
+      Float64Array.from(heat[0], (value) => Math.max(0, 1 - value)),
+    ];
+    return windows.map(normalizeWindow);
+  }
+  if (kind === "needlet") {
+    // A compact needlet-style partition on the spectral radius of the circle.
+    // This is the router bake-off's periodic 1-D analogue, not a claim to a
+    // spherical quadrature construction.
+    const centers = [1 / 32, 1 / 16, 1 / 8, 1 / 4, 1 / 2, 1];
+    return centers.map((center, scale) => normalizeWindow(
+      Float64Array.from(frequencies, (_, index) => {
+        const radial = normalizedFrequency(index);
+        if (radial === 0) return scale === 0 ? 1 : 0;
+        const distance = Math.abs(Math.log2(radial / center));
+        return distance >= 1 ? 0 : Math.cos(Math.PI * distance / 2) ** 2;
+      }),
+    ));
+  }
+
+  const centers = [0, 0.25, 0.5, 0.75];
+  const sigma = 0.13;
+  return centers.map((center) => normalizeWindow(
+    Float64Array.from(frequencies, (frequency) => {
+      const unit = frequency / horizon;
+      const distance = Math.min(Math.abs(unit - center), 1 - Math.abs(unit - center));
+      return Math.exp(-0.5 * (distance / sigma) ** 2);
+    }),
+  ));
+}
+
+interface LocalizedRouterEntry {
+  address: number;
+  projections: Float64Array[];
+  energies: Float64Array;
+}
+
+/**
+ * Phase-preserving coarse router. Uniform spectral samples retain circular
+ * shift as a phase ramp; localized windows turn the reduced IFFTs into a
+ * multiresolution shard score. Fine/full FFT correlation remains unchanged.
+ */
+export class LocalizedSpectralShardRouter {
+  readonly kind: LocalizedSpectralRouterKind;
+  readonly projectionSize: number;
+  readonly horizonSamples: number;
+  readonly frequencies: Uint32Array;
+  private readonly windows: Float64Array[];
+  private readonly entries: LocalizedRouterEntry[] = [];
+
+  constructor(options: {
+    kind: LocalizedSpectralRouterKind;
+    horizonSamples: number;
+    projectionSize: number;
+  }) {
+    const { kind, horizonSamples, projectionSize } = options;
+    if (
+      !Number.isInteger(projectionSize) || projectionSize < 2 ||
+      (projectionSize & (projectionSize - 1)) !== 0 ||
+      projectionSize > horizonSamples || horizonSamples % projectionSize !== 0
+    ) {
+      throw new Error("projectionSize must be a power of two that divides the horizon");
+    }
+    this.kind = kind;
+    this.projectionSize = projectionSize;
+    this.horizonSamples = horizonSamples;
+    const stride = horizonSamples / projectionSize;
+    this.frequencies = Uint32Array.from({ length: projectionSize }, (_, index) => index * stride);
+    this.windows = localizedWindows(kind, this.frequencies, horizonSamples);
+  }
+
+  get storageBytes(): number {
+    return this.entries.reduce(
+      (total, entry) => total + entry.projections.reduce((sum, item) => sum + item.byteLength, 0),
+      0,
+    );
+  }
+
+  add(field: DirectRotorWireField, address = this.entries.length): void {
+    if (field.horizonSamples !== this.horizonSamples || !Number.isInteger(address) || address < 0) {
+      throw new Error("field horizon and non-negative integer address must fit the router");
+    }
+    const projections = this.windows.map((window) =>
+      field.projectSpectrum(this.frequencies, window)
+    );
+    const energies = Float64Array.from(projections, (projection) => {
+      let energy = 0;
+      for (let index = 0; index < projection.length; index++) energy += projection[index] ** 2;
+      return energy;
+    });
+    this.entries.push({ address, projections, energies });
+  }
+
+  route(field: DirectRotorWireField, probe: PreparedWireProbe, topK = 5): HarmonicSearchHit[] {
+    if (field.horizonSamples !== this.horizonSamples || !Number.isInteger(topK) || topK < 1) {
+      throw new Error("probe field must fit and topK must be positive");
+    }
+    const queryProjections = this.windows.map((window) =>
+      field.projectProbe(probe, this.frequencies, window)
+    );
+    const queryEnergies = Float64Array.from(queryProjections, (projection) => {
+      let energy = 0;
+      for (let index = 0; index < projection.length; index++) energy += projection[index] ** 2;
+      return energy;
+    });
+    const candidates = this.entries.map((entry) => {
+      let scoreSquared = 0;
+      let contributingWindows = 0;
+      for (let windowIndex = 0; windowIndex < this.windows.length; windowIndex++) {
+        const denominator = Math.sqrt(entry.energies[windowIndex] * queryEnergies[windowIndex]);
+        if (denominator <= Number.EPSILON) continue;
+        const stored = entry.projections[windowIndex];
+        const query = queryProjections[windowIndex];
+        const correlation = new Float64Array(stored.length);
+        for (let frequency = 0; frequency < this.projectionSize; frequency++) {
+          const storedReal = stored[2 * frequency];
+          const storedImag = stored[2 * frequency + 1];
+          const queryReal = query[2 * frequency];
+          const queryImag = query[2 * frequency + 1];
+          correlation[2 * frequency] = storedReal * queryReal + storedImag * queryImag;
+          correlation[2 * frequency + 1] = storedImag * queryReal - storedReal * queryImag;
+        }
+        fftInPlace(correlation, true);
+        let peak = 0;
+        for (let offset = 0; offset < this.projectionSize; offset++) {
+          peak = Math.max(peak, Math.hypot(correlation[2 * offset], correlation[2 * offset + 1]));
+        }
+        const normalized = peak * this.projectionSize / denominator;
+        scoreSquared += normalized * normalized;
+        contributingWindows++;
+      }
+      return {
+        timeTick: entry.address,
+        score: contributingWindows ? Math.sqrt(scoreSquared / contributingWindows) : 0,
+      };
+    });
+    candidates.sort((left, right) => right.score - left.score);
+    return candidates.slice(0, Math.min(topK, candidates.length));
   }
 }
 

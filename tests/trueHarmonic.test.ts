@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   DirectRotorWireField,
   HarmonicShardRouter,
+  LocalizedSpectralRouterKind,
+  LocalizedSpectralShardRouter,
   SeparableHarmonicWireField,
   hamming74Decode,
   hamming74Encode,
@@ -55,6 +57,20 @@ router.add(direct.spectrumSketch(8), 1);
 router.add(unrelated.spectrumSketch(8), 3);
 const prefixProbe = direct.prepareProbe(encoder.encode("shared-prefix"));
 assert.equal(router.route(direct.probeSketch(prefixProbe, 8), 1)[0].timeTick, 1);
+const localizedKinds: LocalizedSpectralRouterKind[] = [
+  "sparse-fourier", "needlet", "slepian", "diffusion", "gabor",
+];
+for (const kind of localizedKinds) {
+  const localized = new LocalizedSpectralShardRouter({
+    kind,
+    horizonSamples: 4096,
+    projectionSize: 256,
+  });
+  localized.add(direct, 1);
+  localized.add(unrelated, 3);
+  assert.equal(localized.route(direct, prefixProbe, 1)[0].timeTick, 1, `${kind} prefix route`);
+  assert.ok(localized.storageBytes > 0);
+}
 for (const [payload, offset] of directPackets) direct.subtract(payload, offset);
 for (const [, offset] of directPackets) {
   assert.ok(direct.readWave(offset, 64).every((value) => Math.abs(value) < 1e-10));

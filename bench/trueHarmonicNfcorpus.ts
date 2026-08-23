@@ -6,6 +6,8 @@ import { HoloStore } from "../src/lib/holo/engine";
 import {
   DirectRotorWireField,
   HarmonicShardRouter,
+  LocalizedSpectralRouterKind,
+  LocalizedSpectralShardRouter,
   PreparedWireProbe,
   symbolsPerByte,
   wireFrameSymbolLength,
@@ -130,6 +132,21 @@ function buildRouter(shards: DirectShard[]): { router: HarmonicShardRouter; buil
   return { router, buildMs: performance.now() - started };
 }
 
+function buildLocalizedRouter(
+  shards: DirectShard[],
+  kind: LocalizedSpectralRouterKind,
+  projectionSize: number,
+): { router: LocalizedSpectralShardRouter; buildMs: number } {
+  const router = new LocalizedSpectralShardRouter({
+    kind,
+    horizonSamples: shards[0].field.horizonSamples,
+    projectionSize,
+  });
+  const started = performance.now();
+  shards.forEach((shard, address) => router.add(shard.field, address));
+  return { router, buildMs: performance.now() - started };
+}
+
 function routedDirectQuery(
   shards: DirectShard[],
   router: HarmonicShardRouter,
@@ -151,6 +168,102 @@ function routedDirectQuery(
     rankedIds: scored.slice(0, TOP_K).map((row) => row.id),
     ms: performance.now() - started,
     routedShards,
+  };
+}
+
+interface RoutedQueryResult extends QueryResult {
+  routedShards: number[];
+  routeMs: number;
+}
+
+function localizedRoutedDirectQuery(
+  shards: DirectShard[],
+  router: LocalizedSpectralShardRouter,
+  text: string,
+  fec: boolean,
+  routeShards: number,
+): RoutedQueryResult {
+  const bytes = textEncoder.encode(text);
+  const started = performance.now();
+  const probe = shards[0].field.prepareProbe(bytes);
+  const routeStarted = performance.now();
+  const routedShards = router.route(shards[0].field, probe, routeShards).map((hit) => hit.timeTick);
+  const routeMs = performance.now() - routeStarted;
+  const scored = routedShards.flatMap((address) =>
+    scoreShard(shards[address], probe, symbolsPerByte(fec))
+  );
+  scored.sort((left, right) => right.score - left.score);
+  return {
+    queryId: "",
+    rankedIds: scored.slice(0, TOP_K).map((row) => row.id),
+    ms: performance.now() - started,
+    routedShards,
+    routeMs,
+  };
+}
+
+function hybridRoutedDirectQuery(
+  shards: DirectShard[],
+  localRouter: LocalizedSpectralShardRouter,
+  diffuseRouter: LocalizedSpectralShardRouter,
+  text: string,
+  fec: boolean,
+  routeShards: number,
+  localQuota: number,
+): RoutedQueryResult {
+  const bytes = textEncoder.encode(text);
+  const started = performance.now();
+  const probe = shards[0].field.prepareProbe(bytes);
+  const routeStarted = performance.now();
+  const local = localRouter.route(shards[0].field, probe, Math.min(localQuota, routeShards));
+  const diffuse = diffuseRouter.route(shards[0].field, probe, shards.length);
+  const routedShards = local.map((hit) => hit.timeTick);
+  for (const hit of diffuse) {
+    if (routedShards.length >= routeShards) break;
+    if (!routedShards.includes(hit.timeTick)) routedShards.push(hit.timeTick);
+  }
+  const routeMs = performance.now() - routeStarted;
+  const scored = routedShards.flatMap((address) =>
+    scoreShard(shards[address], probe, symbolsPerByte(fec))
+  );
+  scored.sort((left, right) => right.score - left.score);
+  return {
+    queryId: "",
+    rankedIds: scored.slice(0, TOP_K).map((row) => row.id),
+    ms: performance.now() - started,
+    routedShards,
+    routeMs,
+  };
+}
+
+function routingSummary(
+  results: RoutedQueryResult[],
+  qrels: Map<string, Map<string, number>>,
+  documentShards: Map<string, number>,
+): { anyRelevantShardRate: number; meanRelevantDocumentCoverage: number; avgRouteMs: number } {
+  let anyRelevant = 0;
+  let coverage = 0;
+  let evaluated = 0;
+  for (const result of results) {
+    const relevance = qrels.get(result.queryId);
+    if (!relevance) continue;
+    const relevantDocuments = [...relevance.entries()].filter(([, score]) => score > 0);
+    if (!relevantDocuments.length) continue;
+    const routed = new Set(result.routedShards);
+    const covered = relevantDocuments.filter(([id]) => {
+      const shard = documentShards.get(id);
+      return shard !== undefined && routed.has(shard);
+    }).length;
+    anyRelevant += Number(covered > 0);
+    coverage += covered / relevantDocuments.length;
+    evaluated++;
+  }
+  return {
+    anyRelevantShardRate: evaluated ? anyRelevant / evaluated : 0,
+    meanRelevantDocumentCoverage: evaluated ? coverage / evaluated : 0,
+    avgRouteMs: results.length
+      ? results.reduce((total, result) => total + result.routeMs, 0) / results.length
+      : 0,
   };
 }
 
@@ -197,6 +310,11 @@ async function main() {
   const queryCount = intFlag("--queries", 5);
   const shardPower = intFlag("--shard-power", 18);
   const routeShards = intFlag("--route-shards", 8);
+  const routerPower = intFlag("--router-power", 10);
+  const routerKinds = stringFlag(
+    "--router-kinds",
+    "sparse-fourier,needlet,slepian,diffusion,gabor",
+  ).split(",") as LocalizedSpectralRouterKind[];
   const fec = process.argv.includes("--fec");
   const globalField = process.argv.includes("--global");
   assertDataPresent(dataset);
@@ -223,6 +341,10 @@ async function main() {
   const direct = buildDirectIndex(corpus, { fec, shardSamples, maxPayloadBytes });
   const spectrumMs = prepareDirectIndex(direct.shards);
   const harmonicRouter = buildRouter(direct.shards);
+  const localizedRouters = routerKinds.map((kind) => ({
+    kind,
+    ...buildLocalizedRouter(direct.shards, kind, 2 ** routerPower),
+  }));
   const directResults = queries.map((query) => ({
     ...directQuery(direct.shards, query.text, fec),
     queryId: query.id,
@@ -244,6 +366,77 @@ async function main() {
     routeShards,
   );
   const routedPrefixRank = routedPrefix.rankedIds.indexOf(prefixRecord.id) + 1;
+
+  const documentShards = new Map<string, number>();
+  direct.shards.forEach((shard, shardIndex) => {
+    for (const record of shard.records) documentShards.set(record.id, shardIndex);
+  });
+  const localizedResults = localizedRouters.map(({ kind, router, buildMs }) => {
+    const results = queries.map((query) => ({
+      ...localizedRoutedDirectQuery(direct.shards, router, query.text, fec, routeShards),
+      queryId: query.id,
+    }));
+    const prefix = localizedRoutedDirectQuery(
+      direct.shards,
+      router,
+      prefixText,
+      fec,
+      routeShards,
+    );
+    return {
+      kind,
+      projectionSize: router.projectionSize,
+      buildMs,
+      storageMiB: router.storageBytes / 2 ** 20,
+      prefixProbe: {
+        sourceShardIncluded: prefix.routedShards.includes(0),
+        rank: prefix.rankedIds.indexOf(prefixRecord.id) + 1,
+        routeMs: prefix.routeMs,
+        queryMs: prefix.ms,
+      },
+      routing: routingSummary(results, qrels, documentShards),
+      retrieval: summarize(results, qrels),
+    };
+  });
+  const needletRouter = localizedRouters.find(({ kind }) => kind === "needlet")?.router;
+  const diffusionRouter = localizedRouters.find(({ kind }) => kind === "diffusion")?.router;
+  const hybridLocalQuota = Math.min(8, Math.max(1, Math.floor(routeShards / 4)));
+  const hybridResult = needletRouter && diffusionRouter ? (() => {
+    const results = queries.map((query) => ({
+      ...hybridRoutedDirectQuery(
+        direct.shards,
+        needletRouter,
+        diffusionRouter,
+        query.text,
+        fec,
+        routeShards,
+        hybridLocalQuota,
+      ),
+      queryId: query.id,
+    }));
+    const prefix = hybridRoutedDirectQuery(
+      direct.shards,
+      needletRouter,
+      diffusionRouter,
+      prefixText,
+      fec,
+      routeShards,
+      hybridLocalQuota,
+    );
+    return {
+      kind: "needlet+diffusion",
+      localQuota: hybridLocalQuota,
+      candidateShards: routeShards,
+      prefixProbe: {
+        sourceShardIncluded: prefix.routedShards.includes(0),
+        rank: prefix.rankedIds.indexOf(prefixRecord.id) + 1,
+        routeMs: prefix.routeMs,
+        queryMs: prefix.ms,
+      },
+      routing: routingSummary(results, qrels, documentShards),
+      retrieval: summarize(results, qrels),
+    };
+  })() : null;
 
   const holo = holoBenchmark(corpus, queries);
   const directStorageBytes = direct.shards.reduce((total, shard) => total + shard.field.storageBytes, 0);
@@ -280,6 +473,8 @@ async function main() {
         candidateShards: routeShards,
         ...summarize(routedResults, qrels),
       },
+      localizedRouters: localizedResults,
+      localizedHybrid: hybridResult,
     },
     holoStore: {
       indexMs: holo.indexMs,
