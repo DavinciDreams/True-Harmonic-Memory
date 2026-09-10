@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Holographic Frequencies Memory",
+  title: "True Harmonic Memory",
   description:
     "Sphere-wave memory: hypersphere embeddings, Gegenbauer spectral projection, Clifford-algebra binding and holographic retrieval — visualized.",
 };

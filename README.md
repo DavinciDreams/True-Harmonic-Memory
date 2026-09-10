@@ -1,4 +1,17 @@
-# Holographic Frequencies Memory
+# True Harmonic Memory
+
+This repository preserves the harmonic-memory research line from
+[`Holographic-Frequencies-Memory`](https://github.com/DavinciDreams/Holographic-Frequencies-Memory)
+without its later NFT, wallet, contract, encryption, or IPFS features. Its
+history keeps the original non-NFT baseline by `alextitonis` and replays the
+`DavinciDreams` temporal-rotor, reversible-wire, spectral-routing, NFCorpus,
+and temporal-reasoning work as separate authored commits.
+
+The `trueHarmonic.ts` path is a full-fidelity alternative-to-RAG experiment,
+not a database replacement: bytes are framed with length and CRC, optionally
+protected by FEC, Gray-QPSK encoded as an ordered wave, and bound directly to
+rotor/time coordinates. The broader `HoloStore` remains here as the comparison
+engine and benchmark baseline.
 
 A from-scratch holographic associative memory: text is hashed onto a unit
 hypersphere, decomposed into a Gegenbauer harmonic spectrum, bound to context

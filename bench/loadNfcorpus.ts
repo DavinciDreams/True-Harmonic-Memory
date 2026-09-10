@@ -27,7 +27,10 @@ export interface Query {
 /** query-id -> corpus-id -> graded relevance score. */
 export type Qrels = Map<string, Map<string, number>>;
 
-async function readJsonl<T>(file: string, map: (obj: any) => T): Promise<T[]> {
+async function readJsonl<T>(
+  file: string,
+  map: (obj: Record<string, unknown>) => T
+): Promise<T[]> {
   const out: T[] = [];
   const rl = createInterface({ input: createReadStream(file), crlfDelay: Infinity });
   for await (const line of rl) {
@@ -48,15 +51,17 @@ export function assertDataPresent(dataset: string) {
 
 export async function loadCorpus(dataset: string): Promise<Doc[]> {
   return readJsonl(path.join(dataDir(dataset), "corpus.jsonl"), (o) => ({
-    id: o._id,
-    text: [o.title, o.text].filter(Boolean).join(". "),
+    id: String(o._id),
+    text: [o.title, o.text]
+      .filter((part): part is string => typeof part === "string" && part.length > 0)
+      .join(". "),
   }));
 }
 
 export async function loadQueries(dataset: string): Promise<Query[]> {
   return readJsonl(path.join(dataDir(dataset), "queries.jsonl"), (o) => ({
-    id: o._id,
-    text: o.text,
+    id: String(o._id),
+    text: String(o.text),
   }));
 }
 

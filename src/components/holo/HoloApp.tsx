@@ -138,7 +138,7 @@ export default function HoloApp() {
   return (
     <div className="flex min-h-screen flex-col bg-slate-950 text-slate-100">
       <header className="border-b border-slate-800 px-6 py-4">
-        <h1 className="text-xl font-semibold tracking-tight">Holographic Frequencies Memory</h1>
+        <h1 className="text-xl font-semibold tracking-tight">True Harmonic Memory</h1>
         <p className="mt-1 max-w-3xl text-sm text-slate-400">
           Text is hashed onto a unit hypersphere, decomposed into a Gegenbauer harmonic
           spectrum, bound to context via a Clifford geometric product with timestamps encoded as

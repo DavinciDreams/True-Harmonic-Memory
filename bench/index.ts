@@ -63,7 +63,8 @@ function fmtMs(ms: number): string {
 }
 
 function printTable(rows: Array<{ name: string; indexMs: number; summary: MetricSummary }>) {
-  const cols = [
+  type ColumnKey = "name" | "indexMs" | keyof MetricSummary;
+  const cols: ReadonlyArray<readonly [string, ColumnKey]> = [
     ["Method", "name"],
     ["nDCG@10", "ndcg10"],
     ["Recall@100", "recall100"],
@@ -71,14 +72,14 @@ function printTable(rows: Array<{ name: string; indexMs: number; summary: Metric
     ["Index (ms)", "indexMs"],
     ["Avg query", "avgQueryMs"],
     ["p95 query", "p95QueryMs"],
-  ] as const;
+  ];
 
-  const fmt = (row: (typeof rows)[number], key: string): string => {
+  const fmt = (row: (typeof rows)[number], key: ColumnKey): string => {
     if (key === "name") return row.name;
     if (key === "indexMs") return fmtMs(row.indexMs);
     if (key === "avgQueryMs") return fmtMs(row.summary.avgQueryMs);
     if (key === "p95QueryMs") return fmtMs(row.summary.p95QueryMs);
-    const v = (row.summary as any)[key];
+    const v = row.summary[key];
     return v.toFixed(4);
   };
 
